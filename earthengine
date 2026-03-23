@@ -1,0 +1,539 @@
+// ═══════════════════════════════════════════════════════════
+// PROJET H₂ VERT MAROC
+// ═══════════════════════════════════════════════════════════
+
+var maroc = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+              .filter(ee.Filter.eq('country_na', 'Morocco'));
+Map.centerObject(maroc, 6);
+var scale = 5000;
+
+function calcDistance(binaryImage) {
+  return binaryImage
+    .fastDistanceTransform().sqrt()
+    .multiply(ee.Image.pixelArea().sqrt())
+    .divide(1000)
+    .clip(maroc);
+}
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 1 — RESSOURCES
+// ═══════════════════════════════════════════════════════════
+
+// ── GHI ───────────────────────────────────────────────────
+var ghi = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+            .filterDate('2018-01-01','2022-12-31')
+            .select('surface_solar_radiation_downwards_sum')
+            .mean()
+            .multiply(365/3600000)
+            .clip(maroc);
+
+var ghi_c = ee.Image(0)
+  .where(ghi.lt(1650),                             0)
+  .where(ghi.gte(1650).and(ghi.lt(1950)),          1)
+  .where(ghi.gte(1950).and(ghi.lt(2100)),          2)
+  .where(ghi.gte(2100).and(ghi.lt(2150)),          3)
+  .where(ghi.gte(2150),                            4)
+  .clip(maroc).rename('GHI_classe');
+
+// ── Vitesse vent ──────────────────────────────────────────
+var wind_col = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+                 .filterDate('2018-01-01','2022-12-31')
+                 .select(['u_component_of_wind_10m',
+                          'v_component_of_wind_10m'])
+                 .mean();
+
+var wind_speed = wind_col.expression(
+  'sqrt(u*u + v*v)', {
+    'u': wind_col.select('u_component_of_wind_10m'),
+    'v': wind_col.select('v_component_of_wind_10m')
+  }).clip(maroc);
+
+var wind_50m = wind_speed.multiply(
+  Math.log(50/0.03) / Math.log(10/0.03)
+);
+
+var wind_c = ee.Image(0)
+  .where(wind_50m.lt(2.5),                         0)
+  .where(wind_50m.gte(2.5).and(wind_50m.lt(5)),    1)
+  .where(wind_50m.gte(5).and(wind_50m.lt(7.5)),    2)
+  .where(wind_50m.gte(7.5).and(wind_50m.lt(10)),   3)
+  .where(wind_50m.gte(10),                         4)
+  .clip(maroc).rename('Vent_classe');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 2 — OROGRAPHIE
+// ═══════════════════════════════════════════════════════════
+
+var dem = ee.Image("USGS/SRTMGL1_003").clip(maroc);
+var slope = ee.Terrain.slope(dem);
+
+var slope_c = ee.Image(0)
+  .where(slope.gt(45),                             0)
+  .where(slope.gt(10).and(slope.lte(45)),          1)
+  .where(slope.gt(5).and(slope.lte(10)),           2)
+  .where(slope.gt(3).and(slope.lte(5)),            3)
+  .where(slope.gte(1).and(slope.lte(3)),           4)
+  .where(slope.lt(1),                              3)
+  .clip(maroc).rename('Pente_classe');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 3 — CLIMAT
+// ═══════════════════════════════════════════════════════════
+
+var temp = ee.ImageCollection("MODIS/061/MOD11A2")
+             .filterDate('2010-01-01','2023-12-31')
+             .select('LST_Day_1km')
+             .mean()
+             .multiply(0.02).subtract(273.15)
+             .clip(maroc);
+
+var temp_c = ee.Image(0)
+  .where(temp.gt(45),                              0)
+  .where(temp.gt(30).and(temp.lte(45)),            1)
+  .where(temp.gt(15).and(temp.lte(30)),            2)
+  .where(temp.gte(0).and(temp.lte(15)),            3)
+  .clip(maroc).rename('Temp_classe');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 4 — ACCESSIBILITÉ
+// Sources 100% natives GEE — stables et garanties
+// CORRECTION : valeur défaut = 1 (Limite) sur tous les
+//              critères distance pour éviter 0 dans l'AHP
+// ═══════════════════════════════════════════════════════════
+
+// ── Population — utilisée pour plusieurs proxies ──────────
+var pop = ee.Image(
+  "CIESIN/GPWv411/GPW_Population_Density/gpw_v4_population_density_rev11_2020_30_sec")
+  .clip(maroc);
+
+// ── 4a. Distance zones urbaines ───────────────────────────
+// Source : GPW population > 300 hab/km² = zone urbaine
+// Seuils : >20=Limite(1), 15-20=Convenable(2),
+//          10-15=Hautement(3), <10=Excellente(4)
+// CORRECTION : suppression du doublon seuil 25 km
+var urban_bin = pop.gt(300).unmask(0);
+var dist_villes = calcDistance(urban_bin);
+
+var villes_c = ee.Image(1)                                       // défaut Limite
+  .where(dist_villes.lte(20).and(dist_villes.gt(15)),  2)       // Convenable
+  .where(dist_villes.lte(15).and(dist_villes.gt(10)),  3)       // Hautement
+  .where(dist_villes.lte(10),                          4)        // Excellente
+  .clip(maroc).rename('Villes_classe');
+
+// ── 4b. Distance routes et voies ferrées ──────────────────
+// Source : GHSL Built-up Surface 2020 (JRC) — natif GEE
+// Seuils : >15=Limite(1), 10-15=Convenable(2),
+//          5-10=Hautement(3), <5=Excellente(4)
+// CORRECTION : suppression du doublon seuil 25 km
+var ghsl = ee.ImageCollection(
+  "JRC/GHSL/P2023A/GHS_BUILT_S")
+  .filterDate('2020-01-01','2021-01-01')
+  .first()
+  .clip(maroc);
+
+var roads_bin = ghsl.gt(0).unmask(0);
+var dist_routes = calcDistance(roads_bin);
+
+var routes_c = ee.Image(1)                                       // défaut Limite
+  .where(dist_routes.lte(15).and(dist_routes.gt(10)), 2)        // Convenable
+  .where(dist_routes.lte(10).and(dist_routes.gt(5)),  3)        // Hautement
+  .where(dist_routes.lte(5),                          4)        // Excellente
+  .clip(maroc).rename('Routes_classe');
+
+// ── 4c. Distance réseau électrique ────────────────────────
+// Source : VIIRS Nighttime Lights 2022 — natif GEE
+// Luminosité nocturne > 0.5 = zone connectée au réseau
+// Seuils : >15=Limite(1), 10-15=Convenable(2),
+//          5-10=Hautement(3), <5=Excellente(4)
+// CORRECTION : suppression du doublon seuil 25 km
+var nightlights = ee.ImageCollection(
+  "NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG")
+  .filterDate('2022-01-01','2022-12-31')
+  .select('avg_rad')
+  .mean()
+  .clip(maroc);
+
+var elec_bin = nightlights.gt(0.5).unmask(0);
+var dist_elec = calcDistance(elec_bin);
+
+var elec_c = ee.Image(1)                                        // défaut Limite
+  .where(dist_elec.lte(15).and(dist_elec.gt(10)), 2)           // Convenable
+  .where(dist_elec.lte(10).and(dist_elec.gt(5)),  3)           // Hautement
+  .where(dist_elec.lte(5),                         4)          // Excellente
+  .clip(maroc).rename('Elec_classe');
+
+// ── 4d. Distance cours d'eau ──────────────────────────────
+// Source : HydroSHEDS — natif GEE confirmé
+// Seuils : >15=Limite(1), 10-15=Convenable(2),
+//          5-10=Hautement(3), <5=Excellente(4)
+// CORRECTION : suppression du doublon seuil 25 km
+var rivers = ee.Image("WWF/HydroSHEDS/03DIR").clip(maroc);
+var rivers_bin = rivers.gt(0).unmask(0);
+var dist_rivers = calcDistance(rivers_bin);
+
+var rivers_c = ee.Image(1)                                         // défaut Limite
+  .where(dist_rivers.lte(15).and(dist_rivers.gt(10)), 2)          // Convenable
+  .where(dist_rivers.lte(10).and(dist_rivers.gt(5)),  3)          // Hautement
+  .where(dist_rivers.lte(5),                          4)          // Excellente
+  .clip(maroc).rename('Rivieres_classe');
+
+// ── 4e. Distance barrages/réservoirs ──────────────────────
+// Source : JRC Global Surface Water — natif GEE confirmé
+// Eau permanente (occurrence > 90%) = barrages + réservoirs
+// Seuils : >15=Limite(1), 10-15=Convenable(2),
+//          5-10=Hautement(3), <5=Excellente(4)
+// CORRECTION : suppression du doublon seuil 25 km
+var water = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+              .select('occurrence')
+              .clip(maroc);
+
+var water_bin = water.gt(90).unmask(0);
+var dist_dams = calcDistance(water_bin);
+
+var dams_c = ee.Image(1)                                        // défaut Limite
+  .where(dist_dams.lte(15).and(dist_dams.gt(10)), 2)           // Convenable
+  .where(dist_dams.lte(10).and(dist_dams.gt(5)),  3)           // Hautement
+  .where(dist_dams.lte(5),                         4)          // Excellente
+  .clip(maroc).rename('Barrages_classe');
+
+// ── 4f. Distance côte mer — CONTRIBUTION ORIGINALE ────────
+// Pour dessalement eau de mer → alimentation électrolyseurs
+// Source : SRTM land mask — natif GEE confirmé
+// Façades : Atlantique (ouest) + Méditerranée (nord)
+// BBox resserrée sur le Maroc : (-13, 27, 5, 36)
+// Seuils : >100=Limite(1), 50-100=Convenable(2),
+//          20-50=Hautement(3), <20=Excellente(4)
+// CORRECTIONS :
+//   1. BBox (-13,27,5,36) au lieu de (-20,20,5,40)
+//      → évite pixels marins hors façades marocaines
+//      → couvre Atlantique ouest ET Méditerranée nord
+//   2. valeur défaut = 1 (Limite) au lieu de 0
+//      → zones très éloignées classées Limite et non nulles
+
+var land_mask = ee.Image("USGS/SRTMGL1_003")
+                  .mask().unmask(0);
+
+// BBox couvrant strictement les deux façades marocaines :
+//   lon [-13, 5] → Atlantique complet + Méditerranée
+//   lat [27, 36] → du Sahara occidental au détroit de Gibraltar
+var bbox_facades = ee.Geometry.BBox(-13, 27, 5, 36);
+
+var sea_bin = land_mask.eq(0)
+  .clip(bbox_facades);
+
+var dist_coast = sea_bin
+  .fastDistanceTransform().sqrt()
+  .multiply(ee.Image.pixelArea().sqrt())
+  .divide(1000)
+  .clip(maroc);
+
+var coast_c = ee.Image(1)                                                      // défaut Limite
+  .where(dist_coast.lte(100).and(dist_coast.gt(50)),  2)                      // Convenable
+  .where(dist_coast.lte(50).and(dist_coast.gt(20)),   3)                      // Hautement
+  .where(dist_coast.lte(20),                          4)                      // Excellente
+  .clip(maroc).rename('Cote_classe');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 5 — MASQUE EXCLUSION
+// ═══════════════════════════════════════════════════════════
+
+var landcover = ee.ImageCollection("MODIS/061/MCD12Q1")
+                  .filterDate('2020-01-01','2021-01-01')
+                  .select('LC_Type1').first().clip(maroc);
+
+var masque = landcover.neq(0)
+  .and(landcover.neq(17))
+  .and(slope.lt(45))
+  .unmask(0);
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 6 — WEIGHTED OVERLAY
+// Poids AHP EXACTS validés dans Excel
+// Solaire CR=0.03 · Éolien CR=0.04
+// coast_c = variable unique pour les deux façades (4f)
+// ═══════════════════════════════════════════════════════════
+
+// ── SOLAIRE — poids exacts Tableau Excel CR=0.03 ──────────
+// GHI=35.4%, Pente=23.8%, Temp=16.1%, Routes=10.9%
+// Villes=7.5%, Eau+Côte=3.8%, Elec=2.6%
+// Note : Eau+Côte fusionné → réparti entre rivers, dams, coast
+var aptitude_sol = ghi_c.multiply(0.354)
+  .add(slope_c.multiply(0.238))
+  .add(temp_c.multiply(0.161))
+  .add(routes_c.multiply(0.109))
+  .add(villes_c.multiply(0.075))
+  .add(rivers_c.multiply(0.013))   // Eau+Côte 3.8% / 3
+  .add(dams_c.multiply(0.013))     // Eau+Côte 3.8% / 3
+  .add(coast_c.multiply(0.012))    // Eau+Côte 3.8% / 3
+  .add(elec_c.multiply(0.026))
+  .updateMask(masque)
+  .clip(maroc).rename('Aptitude_Solaire');
+
+// ── ÉOLIEN — poids exacts Tableau Excel CR=0.04 ───────────
+// Vent=40.2%, Pente=20.8%, Villes=14.0%, Elec=9.1%
+// Routes=9.1%, Eau+Côte=4.4%, Temp=2.4%
+// Note : Eau+Côte fusionné → réparti entre rivers, dams, coast
+var aptitude_eol = wind_c.multiply(0.402)
+  .add(slope_c.multiply(0.208))
+  .add(villes_c.multiply(0.140))
+  .add(elec_c.multiply(0.091))
+  .add(routes_c.multiply(0.091))
+  .add(rivers_c.multiply(0.015))   // Eau+Côte 4.4% / 3
+  .add(dams_c.multiply(0.015))     // Eau+Côte 4.4% / 3
+  .add(coast_c.multiply(0.014))    // Eau+Côte 4.4% / 3
+  .add(temp_c.multiply(0.024))
+  .updateMask(masque)
+  .clip(maroc).rename('Aptitude_Eolien');
+
+// ── HYBRIDE 50% solaire + 50% éolien ─────────────────────
+var aptitude_hyb = aptitude_sol.multiply(0.5)
+  .add(aptitude_eol.multiply(0.5))
+  .clip(maroc).rename('Aptitude_Hybride');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 7 — VISUALISATION
+// ═══════════════════════════════════════════════════════════
+
+var palette_apt = {
+  min: 0, max: 4,
+  palette: ['808080','9B59B6','E74C3C','3498DB','2ECC71']
+};
+var palette_crit = {
+  min: 0, max: 4,
+  palette: ['red','orange','yellow','lightblue','green']
+};
+
+Map.addLayer(aptitude_sol, palette_apt, ' Aptitude Solaire+H₂', true);
+Map.addLayer(aptitude_eol, palette_apt, ' Aptitude Éolien+H₂',  false);
+Map.addLayer(aptitude_hyb, palette_apt, ' Aptitude Hybride+H₂', false);
+Map.addLayer(ghi_c,    palette_crit, 'GHI classé',         false);
+Map.addLayer(wind_c,   palette_crit, 'Vent classé',        false);
+Map.addLayer(slope_c,  palette_crit, 'Pente classée',      false);
+Map.addLayer(temp_c,   palette_crit, 'Temp classée',       false);
+Map.addLayer(routes_c, palette_crit, 'Routes classées',    false);
+Map.addLayer(elec_c,   palette_crit, 'Elec classée',       false);
+Map.addLayer(rivers_c, palette_crit, 'Rivières classées',  false);
+Map.addLayer(dams_c,   palette_crit, 'Barrages classés',   false);
+Map.addLayer(villes_c, palette_crit, 'Villes classées',    false);
+Map.addLayer(coast_c,  palette_crit, ' Côte mer (Atl. + Méd.)', false);
+
+print(' Script stable — sources 100% natives GEE');
+print('RESSOURCES    : GHI (ERA5) · Vent (ERA5)');
+print('OROGRAPHIE    : Pente (SRTM)');
+print('CLIMAT        : Température (MODIS)');
+print('ACCESSIBILITÉ :');
+print('  Villes      : GPW Population Density');
+print('  Routes      : GHSL Built-up Surface');
+print('  Réseau élec : VIIRS Nighttime Lights');
+print('  Cours eau   : HydroSHEDS');
+print('  Barrages    : JRC Global Surface Water');
+print('  Côte mer    : SRTM Land Mask — Atl. + Méd. BBox(-13,27,5,36)');
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 8 — EXPORTS GOOGLE DRIVE
+// ═══════════════════════════════════════════════════════════
+
+var folder = 'H2_Vert_Maroc_Final';
+var region = maroc.geometry();
+var crs    = 'EPSG:4326';
+var mpix   = 1e13;
+
+Export.image.toDrive({image: aptitude_sol.float(),
+  description: '01_Aptitude_Solaire_Final',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: aptitude_eol.float(),
+  description: '02_Aptitude_Eolien_Final',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: aptitude_hyb.float(),
+  description: '03_Aptitude_Hybride_Final',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: ghi_c.float(),
+  description: '04_GHI_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: wind_c.float(),
+  description: '05_Vent_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: slope_c.float(),
+  description: '06_Pente_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: temp_c.float(),
+  description: '07_Temp_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: routes_c.float(),
+  description: '08_Routes_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: elec_c.float(),
+  description: '09_Elec_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: rivers_c.float(),
+  description: '10_Rivieres_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: dams_c.float(),
+  description: '11_Barrages_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: villes_c.float(),
+  description: '12_Villes_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+Export.image.toDrive({image: coast_c.float(),
+  description: '13_Cote_Mer_classe',
+  folder: folder, region: region,
+  scale: scale, crs: crs, maxPixels: mpix});
+
+// ═══════════════════════════════════════════════════════════
+// BLOC 9 — EXTRACTION PAR SITE
+// CORRECTION : utilise coast_c (4f) — suppression de
+//              coast_c_corr (JRC ocean_mask) qui polluait
+//              l'extraction avec une variable redondante
+//              incohérente avec le Bloc 6
+// ═══════════════════════════════════════════════════════════
+
+var sites = ee.FeatureCollection([
+
+  // Priorité 1 — Sud (fort potentiel)
+  ee.Feature(ee.Geometry.Point([-13.50, 27.00]),
+    {nom: 'Laayoune',      region: 'Laayoune-Sakia_El_Hamra'}),
+  ee.Feature(ee.Geometry.Point([-12.92, 27.93]),
+    {nom: 'Tarfaya',       region: 'Laayoune-Sakia_El_Hamra'}),
+  ee.Feature(ee.Geometry.Point([-14.80, 26.00]),
+    {nom: 'Boujdour',      region: 'Laayoune-Sakia_El_Hamra'}),
+  ee.Feature(ee.Geometry.Point([-16.20, 23.50]),
+    {nom: 'Dakhla',        region: 'Dakhla-Oued_Ed_Dahab'}),
+  ee.Feature(ee.Geometry.Point([-17.00, 21.50]),
+    {nom: 'Aousserd',      region: 'Dakhla-Oued_Ed_Dahab'}),
+
+  // Priorité 2 — Centre-Sud
+  ee.Feature(ee.Geometry.Point([-6.89,  30.92]),
+    {nom: 'Ouarzazate',    region: 'Draa-Tafilalet'}),
+  ee.Feature(ee.Geometry.Point([-4.00,  31.50]),
+    {nom: 'Errachidia',    region: 'Draa-Tafilalet'}),
+  ee.Feature(ee.Geometry.Point([-5.52,  30.40]),
+    {nom: 'Zagora',        region: 'Draa-Tafilalet'}),
+  ee.Feature(ee.Geometry.Point([-10.06, 28.99]),
+    {nom: 'Guelmim',       region: 'Guelmim-Oued_Noun'}),
+  ee.Feature(ee.Geometry.Point([-12.50, 28.00]),
+    {nom: 'Tan_Tan',       region: 'Guelmim-Oued_Noun'}),
+
+  // Priorité 3 — Souss-Massa
+  ee.Feature(ee.Geometry.Point([-9.60,  30.43]),
+    {nom: 'Agadir',        region: 'Souss-Massa'}),
+  ee.Feature(ee.Geometry.Point([-8.50,  29.70]),
+    {nom: 'Tiznit',        region: 'Souss-Massa'}),
+
+  // Priorité 4 — Oriental
+  ee.Feature(ee.Geometry.Point([-1.50,  34.50]),
+    {nom: 'Oujda',         region: 'Oriental'}),
+  ee.Feature(ee.Geometry.Point([-2.93,  34.68]),
+    {nom: 'Nador',         region: 'Oriental'}),
+  ee.Feature(ee.Geometry.Point([-2.17,  32.50]),
+    {nom: 'Figuig',        region: 'Oriental'}),
+
+  // Priorité 5 — Marrakech-Safi
+  ee.Feature(ee.Geometry.Point([-7.95,  32.23]),
+    {nom: 'Ben_Guerir',    region: 'Marrakech-Safi'}),
+  ee.Feature(ee.Geometry.Point([-8.00,  31.63]),
+    {nom: 'Marrakech',     region: 'Marrakech-Safi'}),
+  ee.Feature(ee.Geometry.Point([-9.77,  31.52]),
+    {nom: 'Essaouira',     region: 'Marrakech-Safi'}),
+
+  // Priorité 6 — Fès-Meknès
+  ee.Feature(ee.Geometry.Point([-5.00,  34.03]),
+    {nom: 'Fes',           region: 'Fes-Meknes'}),
+  ee.Feature(ee.Geometry.Point([-5.55,  33.89]),
+    {nom: 'Meknes',        region: 'Fes-Meknes'}),
+
+  // Priorité 7 — Casablanca-Settat
+  ee.Feature(ee.Geometry.Point([-8.64,  33.07]),
+    {nom: 'Jorf_Lasfar',   region: 'Casablanca-Settat'}),
+  ee.Feature(ee.Geometry.Point([-7.62,  33.00]),
+    {nom: 'Settat',        region: 'Casablanca-Settat'}),
+  ee.Feature(ee.Geometry.Point([-7.80,  33.40]),
+    {nom: 'Casablanca',    region: 'Casablanca-Settat'}),
+
+  // Priorité 8 — Béni Mellal-Khénifra
+  ee.Feature(ee.Geometry.Point([-6.36,  32.34]),
+    {nom: 'Beni_Mellal',   region: 'Beni_Mellal-Khenifra'}),
+  ee.Feature(ee.Geometry.Point([-5.67,  32.93]),
+    {nom: 'Khenifra',      region: 'Beni_Mellal-Khenifra'}),
+
+  // Priorité 9 — Rabat-Salé-Kénitra
+  ee.Feature(ee.Geometry.Point([-6.85,  34.02]),
+    {nom: 'Rabat',         region: 'Rabat-Sale-Kenitra'}),
+  ee.Feature(ee.Geometry.Point([-6.58,  34.26]),
+    {nom: 'Sale',          region: 'Rabat-Sale-Kenitra'}),
+  ee.Feature(ee.Geometry.Point([-6.60,  34.40]),
+    {nom: 'Kenitra',       region: 'Rabat-Sale-Kenitra'}),
+
+  // Priorité 10 — Tanger-Tétouan
+  ee.Feature(ee.Geometry.Point([-5.90,  35.50]),
+    {nom: 'Tanger',        region: 'Tanger-Tetouan'}),
+  ee.Feature(ee.Geometry.Point([-5.37,  35.57]),
+    {nom: 'Tetouan',       region: 'Tanger-Tetouan'}),
+  ee.Feature(ee.Geometry.Point([-3.93,  35.17]),
+    {nom: 'Al_Hoceima',    region: 'Tanger-Tetouan'})
+]);
+
+// ── Combiner toutes les couches pour extraction ───────────
+// CORRECTION : coast_c unique (Bloc 4f) — suppression de
+//              coast_c_corr redondante et incohérente
+var all_layers = aptitude_sol.unmask(0).rename('Apt_Solaire')
+  .addBands(aptitude_eol.unmask(0).rename('Apt_Eolien'))
+  .addBands(aptitude_hyb.unmask(0).rename('Apt_Hybride'))
+  .addBands(ghi_c.unmask(0).rename('GHI_classe'))
+  .addBands(wind_c.unmask(0).rename('Vent_classe'))
+  .addBands(slope_c.unmask(0).rename('Pente_classe'))
+  .addBands(temp_c.unmask(0).rename('Temp_classe'))
+  .addBands(routes_c.unmask(0).rename('Routes_classe'))
+  .addBands(elec_c.unmask(0).rename('Elec_classe'))
+  .addBands(rivers_c.unmask(0).rename('Eau_classe'))
+  .addBands(dams_c.unmask(0).rename('Barrages_classe'))
+  .addBands(villes_c.unmask(0).rename('Villes_classe'))
+  .addBands(coast_c.unmask(0).rename('Cote_classe'));   // ← coast_c du Bloc 4f
+
+// ── Extraire valeurs par site ──────────────────────────────
+var extraction = all_layers.sampleRegions({
+  collection: sites,
+  properties: ['nom', 'region'],
+  scale: 5000,
+  tileScale: 4
+});
+
+// ── Afficher résultats ─────────────────────────────────────
+print('=== RÉSULTATS PAR SITE ET RÉGION ===');
+print(extraction);
+
+// ── Afficher sites sur carte ───────────────────────────────
+Map.addLayer(sites, {color: 'FF0000'}, '📍 Tous les sites');
+
+print('→ Clique Tasks → RUN sur chaque export');
+
+// ── Exporter CSV ───────────────────────────────────────────
+Export.table.toDrive({
+  collection: extraction,
+  description: 'Toutes_Regions_H2_Maroc',
+  folder: 'Handling_de_H2_vert',
+  fileFormat: 'CSV'
+});
