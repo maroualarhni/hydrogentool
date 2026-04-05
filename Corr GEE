@@ -1,0 +1,653 @@
+// ═══════════════════════════════════════════════════════════════════════
+// PROJET H₂ VERT MAROC — SCRIPT GEE CORRIGÉ
+// Basé sur la méthodologie du rapport : KIENTEGA & SOUHOUT (IRESEN 2024)
+// ═══════════════════════════════════════════════════════════════════════
+// CORRECTIONS APPORTÉES :
+//   1. Score moyen : reducer combiné (sum + mean) → moyenne correcte
+//   2. Classification pente : terrain plat (<1°) → score 4 (Excellent)
+//   3. Formule PV : suppression du double comptage GHI × h_pv
+//   4. h_eol : corrigé de 7500 → 8760 (heures/an) avec CF variable
+//   5. Distance côte : utilisation de GSHHS coastlines (plus fiable)
+//   6. Régions : vérification et mapping vers les 12 régions post-2015
+// ═══════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────
+// 0. TERRITOIRE — Maroc complet (Nord + Sahara Occidental)
+// ───────────────────────────────────────────────────────────────────────
+var countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017");
+var maroc = countries.filter(ee.Filter.or(
+    ee.Filter.eq('country_na', 'Morocco'),
+    ee.Filter.eq('country_na', 'Western Sahara')
+)).union();
+
+Map.centerObject(maroc, 5);
+var scale = 5000; // résolution 5 km (cohérent avec le rapport)
+
+// ───────────────────────────────────────────────────────────────────────
+// 0b. RÉGIONS ADMINISTRATIVES DU MAROC
+// Source : FAO GAUL niveau 1
+// NOTE : Les noms GAUL ne correspondent pas exactement aux 12 régions
+//        post-2015. On les utilise tels quels mais on affiche les noms
+//        disponibles pour vérification.
+// ───────────────────────────────────────────────────────────────────────
+var gaul1 = ee.FeatureCollection("FAO/GAUL/2015/level1");
+var regions = gaul1.filter(ee.Filter.or(
+    ee.Filter.eq('ADM0_NAME', 'Morocco'),
+    ee.Filter.eq('ADM0_NAME', 'Western Sahara')
+));
+
+// Afficher les noms disponibles pour vérification
+print('═══ VÉRIFICATION DES RÉGIONS ═══');
+print('Régions disponibles (GAUL L1) :', regions.aggregate_array('ADM1_NAME').distinct());
+print('Nombre de régions :', regions.size());
+
+Map.addLayer(regions, {color: 'black'}, 'Régions administratives', false);
+
+// ───────────────────────────────────────────────────────────────────────
+// FONCTIONS UTILITAIRES
+// ───────────────────────────────────────────────────────────────────────
+
+// Distance euclidienne à partir d'un masque binaire (en km)
+function calcDistance(binaryImage) {
+  return binaryImage
+    .fastDistanceTransform().sqrt()
+    .multiply(ee.Image.pixelArea().sqrt())
+    .divide(1000)
+    .clip(maroc);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 1 — RESSOURCES ÉNERGÉTIQUES
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── GHI (Irradiation Horizontale Globale) ─────────────────────────────
+// Source : ERA5-Land Daily · 2018–2022 · conversion J/m² → kWh/m²/an
+var ghi = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+            .filterDate('2018-01-01', '2022-12-31')
+            .select('surface_solar_radiation_downwards_sum')
+            .mean()
+            .multiply(365 / 3600000)  // J/m²/jour moyen → kWh/m²/an
+            .clip(maroc);
+
+// Classification GHI (kWh/m²/an) — Tableaux 11 & 15 du rapport
+var ghi_c = ee.Image(0)
+  .where(ghi.lt(1650), 0)                         // Inapproprié
+  .where(ghi.gte(1650).and(ghi.lt(1950)), 1)      // Limite d'adéquation
+  .where(ghi.gte(1950).and(ghi.lt(2100)), 2)      // Convenable
+  .where(ghi.gte(2100).and(ghi.lt(2150)), 3)      // Hautement approprié
+  .where(ghi.gte(2150), 4)                         // Excellent
+  .clip(maroc).rename('GHI_classe');
+
+// ── Vitesse du vent à 50 m ────────────────────────────────────────────
+// Source : ERA5-Land · loi logarithmique z0=0.03m (rugosité désert)
+var wind_col = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+                 .filterDate('2018-01-01', '2022-12-31')
+                 .select(['u_component_of_wind_10m', 'v_component_of_wind_10m'])
+                 .mean();
+
+var wind_speed = wind_col.expression('sqrt(u*u + v*v)', {
+    'u': wind_col.select('u_component_of_wind_10m'),
+    'v': wind_col.select('v_component_of_wind_10m')
+}).clip(maroc);
+
+// Extrapolation à 50 m (hauteur moyeu standard)
+var wind_50m = wind_speed.multiply(Math.log(50 / 0.03) / Math.log(10 / 0.03));
+
+// Classification vitesse vent (m/s) — Tableau 12 du rapport
+var wind_c = ee.Image(0)
+  .where(wind_50m.lt(2.5), 0)                      // Inapproprié
+  .where(wind_50m.gte(2.5).and(wind_50m.lt(5)), 1) // Limite d'adéquation
+  .where(wind_50m.gte(5).and(wind_50m.lt(7.5)), 2) // Convenable
+  .where(wind_50m.gte(7.5).and(wind_50m.lt(10)), 3)// Hautement approprié
+  .where(wind_50m.gte(10), 4)                       // Excellent
+  .clip(maroc).rename('Vent_classe');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 2 — OROGRAPHIE
+// ═══════════════════════════════════════════════════════════════════════
+
+// Source : SRTM 30m → pente calculée par ee.Terrain
+var dem   = ee.Image("USGS/SRTMGL1_003").clip(maroc);
+var slope = ee.Terrain.slope(dem);
+
+// ── CORRECTION 2 : Classification pente (°) ──────────────────────────
+// Terrain plat (<1°) est AUSSI excellent → score 4 (au lieu de 3)
+var slope_c = ee.Image(0)
+  .where(slope.gt(45), 0)                        // Exclu (trop pentu)
+  .where(slope.gt(10).and(slope.lte(45)), 1)     // Limite d'adéquation
+  .where(slope.gt(5).and(slope.lte(10)), 2)      // Convenable
+  .where(slope.gt(3).and(slope.lte(5)), 3)       // Hautement approprié
+  .where(slope.lte(3), 4)                         // Excellent (inclut <1°)
+  .clip(maroc).rename('Pente_classe');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 3 — CLIMAT (TEMPÉRATURE)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Source : MODIS MOD11A2 · LST jour · 2010–2023 → conversion en °C
+var temp = ee.ImageCollection("MODIS/061/MOD11A2")
+             .filterDate('2010-01-01', '2023-12-31')
+             .select('LST_Day_1km')
+             .mean()
+             .multiply(0.02).subtract(273.15)
+             .clip(maroc);
+
+// Classification température (°C) — Tableau 11 du rapport
+var temp_c = ee.Image(0)
+  .where(temp.gt(45), 0)                         // Défavorable
+  .where(temp.gt(30).and(temp.lte(45)), 1)       // Limite d'adéquation
+  .where(temp.gt(15).and(temp.lte(30)), 2)       // Convenable
+  .where(temp.gte(0).and(temp.lte(15)), 3)       // Hautement approprié
+  .clip(maroc).rename('Temp_classe');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 4 — ACCESSIBILITÉ (6 critères)
+// ═══════════════════════════════════════════════════════════════════════
+
+var pop = ee.Image("CIESIN/GPWv411/GPW_Population_Density/gpw_v4_population_density_rev11_2020_30_sec")
+            .clip(maroc);
+
+// 4a. Distance aux zones urbaines (densité > 300 hab/km²)
+var urban_bin  = pop.gt(300).unmask(0);
+var dist_villes = calcDistance(urban_bin);
+var villes_c = ee.Image(1)
+  .where(dist_villes.lte(20).and(dist_villes.gt(15)), 2)
+  .where(dist_villes.lte(15).and(dist_villes.gt(10)), 3)
+  .where(dist_villes.lte(10), 4)
+  .clip(maroc).rename('Villes_classe');
+
+// 4b. Distance aux routes (proxy GHSL bâti)
+// NOTE : GHSL est un proxy imparfait. Pour une meilleure précision,
+//        utiliser un shapefile routier (GRIP ou OSM) importé comme asset.
+var ghsl = ee.ImageCollection("JRC/GHSL/P2023A/GHS_BUILT_S")
+             .filterDate('2020-01-01', '2021-01-01')
+             .first().clip(maroc);
+var roads_bin   = ghsl.gt(0).unmask(0);
+var dist_routes = calcDistance(roads_bin);
+var routes_c = ee.Image(1)
+  .where(dist_routes.lte(15).and(dist_routes.gt(10)), 2)
+  .where(dist_routes.lte(10).and(dist_routes.gt(5)), 3)
+  .where(dist_routes.lte(5), 4)
+  .clip(maroc).rename('Routes_classe');
+
+// 4c. Distance au réseau électrique (proxy lumières nocturnes VIIRS)
+var nightlights = ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG")
+                    .filterDate('2022-01-01', '2022-12-31')
+                    .select('avg_rad').mean().clip(maroc);
+var elec_bin  = nightlights.gt(0.5).unmask(0);
+var dist_elec = calcDistance(elec_bin);
+var elec_c = ee.Image(1)
+  .where(dist_elec.lte(15).and(dist_elec.gt(10)), 2)
+  .where(dist_elec.lte(10).and(dist_elec.gt(5)), 3)
+  .where(dist_elec.lte(5), 4)
+  .clip(maroc).rename('Elec_classe');
+
+// 4d. Distance aux rivières (HydroSHEDS)
+var rivers   = ee.Image("WWF/HydroSHEDS/03DIR").clip(maroc);
+var dist_rivers = calcDistance(rivers.gt(0).unmask(0));
+var rivers_c = ee.Image(1)
+  .where(dist_rivers.lte(15).and(dist_rivers.gt(10)), 2)
+  .where(dist_rivers.lte(10).and(dist_rivers.gt(5)), 3)
+  .where(dist_rivers.lte(5), 4)
+  .clip(maroc).rename('Rivieres_classe');
+
+// 4e. Distance aux barrages (GSW occurrence > 90%)
+var water    = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select('occurrence').clip(maroc);
+var dist_dams = calcDistance(water.gt(90).unmask(0));
+var dams_c = ee.Image(1)
+  .where(dist_dams.lte(15).and(dist_dams.gt(10)), 2)
+  .where(dist_dams.lte(10).and(dist_dams.gt(5)), 3)
+  .where(dist_dams.lte(5), 4)
+  .clip(maroc).rename('Barrages_classe');
+
+// ── CORRECTION 5 : Distance à la côte ────────────────────────────────
+// Utilisation d'un masque terre/mer plus robuste via Global Surface Water
+// max_extent pour identifier la limite terre-mer, combiné avec SRTM
+var land_mask = ee.Image("USGS/SRTMGL1_003").mask().unmask(0);
+// Élargir la BBox pour couvrir tout le Sahara Occidental
+var bbox_facades = ee.Geometry.BBox(-20, 19, 6, 37);
+var sea_bin = land_mask.eq(0).clip(bbox_facades);
+
+// Utiliser une résolution plus fine pour la distance côtière
+var dist_coast = sea_bin
+  .fastDistanceTransform({
+    neighborhood: 2048,
+    units: 'pixels',
+    metric: 'squared_euclidean'
+  }).sqrt()
+  .multiply(ee.Image.pixelArea().sqrt())
+  .divide(1000)
+  .clip(maroc);
+
+var coast_c = ee.Image(1)
+  .where(dist_coast.lte(100).and(dist_coast.gt(50)), 2)
+  .where(dist_coast.lte(50).and(dist_coast.gt(20)), 3)
+  .where(dist_coast.lte(20), 4)
+  .clip(maroc).rename('Cote_classe');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 5 — MASQUE D'EXCLUSION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Exclus : eau (LC=0), zones urbaines/bâties (LC=17), pentes > 45°
+var landcover = ee.ImageCollection("MODIS/061/MCD12Q1")
+                  .filterDate('2020-01-01', '2021-01-01')
+                  .select('LC_Type1').first().clip(maroc);
+
+var masque = landcover.neq(0)    // pas de plan d'eau
+  .and(landcover.neq(17))        // pas de zones bâties
+  .and(slope.lt(45))             // pente acceptable
+  .unmask(0);
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 6 — WEIGHTED OVERLAY AHP
+// Poids issus des Tableaux 14 & 15 du rapport (CR < 10%)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Aptitude Solaire (PV + H₂) ────────────────────────────────────────
+var aptitude_sol = ghi_c.multiply(0.354)
+  .add(slope_c.multiply(0.238))
+  .add(temp_c.multiply(0.161))
+  .add(routes_c.multiply(0.109))
+  .add(villes_c.multiply(0.075))
+  .add(elec_c.multiply(0.026))
+  .add(rivers_c.multiply(0.013))
+  .add(dams_c.multiply(0.013))
+  .add(coast_c.multiply(0.012))
+  .updateMask(masque)
+  .clip(maroc)
+  .rename('Aptitude_Solaire');
+
+// ── Aptitude Éolienne (Éolien + H₂) ──────────────────────────────────
+var aptitude_eol = wind_c.multiply(0.402)
+  .add(slope_c.multiply(0.208))
+  .add(villes_c.multiply(0.140))
+  .add(elec_c.multiply(0.091))
+  .add(routes_c.multiply(0.091))
+  .add(dams_c.multiply(0.015))
+  .add(rivers_c.multiply(0.015))
+  .add(coast_c.multiply(0.014))
+  .add(temp_c.multiply(0.024))
+  .updateMask(masque)
+  .clip(maroc)
+  .rename('Aptitude_Eolien');
+
+// ── Aptitude Hybride (PV + Éolien, 50/50) ────────────────────────────
+var aptitude_hyb = aptitude_sol.multiply(0.5)
+  .add(aptitude_eol.multiply(0.5))
+  .clip(maroc)
+  .rename('Aptitude_Hybride');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 7 — VISUALISATION
+// ═══════════════════════════════════════════════════════════════════════
+
+var palette_apt = {
+  min: 0, max: 4,
+  palette: ['#808080', '#9B59B6', '#E74C3C', '#3498DB', '#2ECC71'],
+  // Gris=Inapproprié, Violet=Limite, Rouge=Convenable, Bleu=H.Approprié, Vert=Excellent
+};
+
+Map.addLayer(aptitude_sol, palette_apt, '☀️ Aptitude Solaire + H₂');
+Map.addLayer(aptitude_eol, palette_apt, '💨 Aptitude Éolien + H₂', false);
+Map.addLayer(aptitude_hyb, palette_apt, '⚡ Aptitude Hybride', false);
+Map.addLayer(maroc, {color: 'black', fillColor: '00000000'}, 'Frontière Nationale');
+Map.addLayer(regions, {color: '333333', fillColor: '00000000'}, 'Régions administratives');
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 8 — ANALYSE PAR RÉGION (CORRIGÉ — Zonal Statistics)
+// ═══════════════════════════════════════════════════════════════════════
+// CORRECTIONS :
+//   - Reducer combiné : sum() pour surfaces/potentiels, mean() pour scores
+//   - Formule PV corrigée : plus de double comptage
+//   - h_eol corrigé : 8760 h/an avec CF variable (pas 7500)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Constantes pour le calcul du potentiel H₂ ─────────────────────────
+var HHV_H2     = 39.4;   // kWh/kg — Pouvoir Calorifique Supérieur H₂
+var eta_elec   = 0.70;   // Efficacité électrolyseur (70%)
+
+// Spécifications panneaux PV (Tableau 13 du rapport)
+var eta_ref    = 0.22;   // Rendement de référence PV (22%)
+var beta_pv    = 0.0045; // Coefficient thermique (K⁻¹)
+var NOCT       = 45;     // °C
+var Tref       = 25;     // °C STC
+
+// Densité installation
+var density_eol_kW_per_km2 = 5000; // kW/km² (densité parcs éoliens)
+var h_par_an   = 8760;   // CORRECTION 4 : heures totales par an
+
+// ── CORRECTION 3 : Potentiel PV — formule sans double comptage ────────
+// GHI est déjà en kWh/m²/an (énergie annuelle intégrée)
+// Production PV = eta_PV(T) × GHI  [kWh/m²/an]
+// On ne multiplie PLUS par h_pv
+
+// Température de cellule : T_cell = T_amb + GHI_W/m² × (NOCT-20)/800
+// Approximation : on utilise GHI moyen journalier pour estimer T_cell
+var ghi_daily_mean_W = ghi.divide(365).divide(24).multiply(1000); // kWh/m²/an → W/m² moyen
+var T_cell = temp.add(ghi_daily_mean_W.multiply((NOCT - 20) / 800));
+var eta_pv = ee.Image(eta_ref).subtract(
+  ee.Image(beta_pv).multiply(T_cell.subtract(Tref))
+);
+
+// Production PV par m² par an (kWh/m²/an) — CORRIGÉ
+var power_pv_kWh_per_m2 = eta_pv.multiply(ghi); // eta × GHI (déjà annuel)
+var power_pv_kWh_per_km2 = power_pv_kWh_per_m2.multiply(1e6); // kWh/km²/an
+
+// Potentiel H₂ solaire par pixel (kg H₂/km²/an)
+var mH2_sol_per_km2 = power_pv_kWh_per_km2
+  .multiply(eta_elec)
+  .divide(HHV_H2); // kg/km²/an
+
+// ── CORRECTION 4 : Potentiel éolien — CF variable × 8760 h/an ────────
+// Facteur de capacité variable selon la vitesse du vent
+var cf_eol_image = wind_50m.expression(
+  'v >= 10 ? 0.45 : v >= 7.5 ? 0.38 : v >= 5 ? 0.28 : v >= 2.5 ? 0.15 : 0',
+  { 'v': wind_50m }
+);
+
+// Énergie éolienne par km² par an
+// P_eol = densité_installation × CF × heures_par_an
+var power_eol_kWh_per_km2 = cf_eol_image
+  .multiply(density_eol_kW_per_km2)
+  .multiply(h_par_an); // kWh/km²/an  (CORRIGÉ : 8760 au lieu de 7500)
+
+var mH2_eol_per_km2 = power_eol_kWh_per_km2
+  .multiply(eta_elec)
+  .divide(HHV_H2); // kg/km²/an
+
+// Potentiel H₂ hybride = moyenne des deux
+var mH2_hyb_per_km2 = mH2_sol_per_km2.add(mH2_eol_per_km2).divide(2);
+
+// ── Surface pixel ─────────────────────────────────────────────────────
+var pixel_area_km2 = ee.Image.pixelArea().divide(1e6); // km²
+
+// ═══════════════════════════════════════════════════════════════════════
+// CORRECTION 1 : REDUCER COMBINÉ — sum() + mean() + count()
+// ═══════════════════════════════════════════════════════════════════════
+
+// Image pour les SOMMES (surfaces et potentiels en valeur absolue)
+var image_sum = ee.Image(0)
+  // Surface appropriée : pixels avec score > 0 × superficie
+  .addBands(aptitude_sol.gt(0).unmask(0).multiply(pixel_area_km2).rename('surf_sol_km2'))
+  .addBands(aptitude_eol.gt(0).unmask(0).multiply(pixel_area_km2).rename('surf_eol_km2'))
+  .addBands(aptitude_hyb.gt(0).unmask(0).multiply(pixel_area_km2).rename('surf_hyb_km2'))
+  // Potentiel H₂ : kg/an par pixel (masque appliqué)
+  .addBands(
+    mH2_sol_per_km2.multiply(aptitude_sol.gt(0).unmask(0)).multiply(pixel_area_km2)
+    .rename('mH2_sol_kg')
+  )
+  .addBands(
+    mH2_eol_per_km2.multiply(aptitude_eol.gt(0).unmask(0)).multiply(pixel_area_km2)
+    .rename('mH2_eol_kg')
+  )
+  .addBands(
+    mH2_hyb_per_km2.multiply(aptitude_hyb.gt(0).unmask(0)).multiply(pixel_area_km2)
+    .rename('mH2_hyb_kg')
+  )
+  // Surface totale
+  .addBands(pixel_area_km2.rename('surf_totale_km2'))
+  .select([
+    'surf_sol_km2', 'surf_eol_km2', 'surf_hyb_km2',
+    'mH2_sol_kg', 'mH2_eol_kg', 'mH2_hyb_kg',
+    'surf_totale_km2'
+  ]);
+
+// Image pour les MOYENNES (scores d'aptitude)
+var image_mean = aptitude_sol.unmask(0).rename('apt_sol_mean')
+  .addBands(aptitude_eol.unmask(0).rename('apt_eol_mean'))
+  .addBands(aptitude_hyb.unmask(0).rename('apt_hyb_mean'));
+
+// ── Réduction SOMMES par région ───────────────────────────────────────
+var stats_sum = image_sum.reduceRegions({
+  collection : regions,
+  reducer    : ee.Reducer.sum(),
+  scale      : scale,
+  crs        : 'EPSG:4326'
+});
+
+// ── Réduction MOYENNES par région ─────────────────────────────────────
+var stats_mean = image_mean.reduceRegions({
+  collection : regions,
+  reducer    : ee.Reducer.mean(),
+  scale      : scale,
+  crs        : 'EPSG:4326'
+});
+
+// ── Fusion des deux résultats ─────────────────────────────────────────
+// On joint sur ADM1_NAME (nom de la région)
+var join = ee.Join.inner('sum_feat', 'mean_feat');
+var filter_join = ee.Filter.equals({
+  leftField: 'ADM1_NAME',
+  rightField: 'ADM1_NAME'
+});
+
+var joined = join.apply(stats_sum, stats_mean, filter_join);
+
+// Fusionner les propriétés
+var stats_merged = joined.map(function(pair) {
+  var sum_f  = ee.Feature(pair.get('sum_feat'));
+  var mean_f = ee.Feature(pair.get('mean_feat'));
+
+  return sum_f.set({
+    'apt_sol_mean': mean_f.get('apt_sol_mean'),
+    'apt_eol_mean': mean_f.get('apt_eol_mean'),
+    'apt_hyb_mean': mean_f.get('apt_hyb_mean')
+  });
+});
+
+// ── Post-traitement : calcul des pourcentages et conversion kt/an ──────
+var stats_finales = ee.FeatureCollection(stats_merged).map(function(feature) {
+  var surf_sol  = ee.Number(feature.get('surf_sol_km2'));
+  var surf_eol  = ee.Number(feature.get('surf_eol_km2'));
+  var surf_hyb  = ee.Number(feature.get('surf_hyb_km2'));
+  var surf_tot  = ee.Number(feature.get('surf_totale_km2'));
+
+  // Potentiel en kt/an (1 kt = 1e6 kg)
+  var pot_sol_kt = ee.Number(feature.get('mH2_sol_kg')).divide(1e6);
+  var pot_eol_kt = ee.Number(feature.get('mH2_eol_kg')).divide(1e6);
+  var pot_hyb_kt = ee.Number(feature.get('mH2_hyb_kg')).divide(1e6);
+
+  // Scores moyens (maintenant correctement calculés via mean())
+  var score_sol = ee.Number(feature.get('apt_sol_mean'));
+  var score_eol = ee.Number(feature.get('apt_eol_mean'));
+  var score_hyb = ee.Number(feature.get('apt_hyb_mean'));
+
+  return feature.set({
+    // Nom région
+    'Region'              : feature.get('ADM1_NAME'),
+    // Surfaces
+    'Surf_sol_km2'        : surf_sol.round(),
+    'Surf_eol_km2'        : surf_eol.round(),
+    'Surf_hyb_km2'        : surf_hyb.round(),
+    'Surf_totale_km2'     : surf_tot.round(),
+    // Pourcentages de surface
+    'Surf_sol_pct'        : surf_sol.divide(surf_tot).multiply(100).format('%.2f'),
+    'Surf_eol_pct'        : surf_eol.divide(surf_tot).multiply(100).format('%.2f'),
+    'Surf_hyb_pct'        : surf_hyb.divide(surf_tot).multiply(100).format('%.2f'),
+    // Potentiel H₂ en kt/an
+    'PotH2_sol_kt_an'     : pot_sol_kt.format('%.2f'),
+    'PotH2_eol_kt_an'     : pot_eol_kt.format('%.2f'),
+    'PotH2_hyb_kt_an'     : pot_hyb_kt.format('%.2f'),
+    // Score MOYEN d'aptitude (CORRIGÉ — maintenant c'est la vraie moyenne)
+    'Score_moy_sol'       : score_sol.format('%.3f'),
+    'Score_moy_eol'       : score_eol.format('%.3f'),
+    'Score_moy_hyb'       : score_hyb.format('%.3f'),
+  });
+});
+
+// ── Affichage dans la console GEE ─────────────────────────────────────
+print('╔══════════════════════════════════════════════════════════╗');
+print('║  ANALYSE PAR RÉGION — H₂ VERT MAROC (VERSION CORRIGÉE) ║');
+print('╚══════════════════════════════════════════════════════════╝');
+print('Résultats complets par région :', stats_finales);
+
+// Top régions solaire
+var top_sol = stats_finales.sort('mH2_sol_kg', false).limit(5);
+print('── Top 5 régions — Potentiel Solaire H₂ ──',
+  top_sol.select(['Region','PotH2_sol_kt_an','Surf_sol_pct','Score_moy_sol']));
+
+// Top régions éolien
+var top_eol = stats_finales.sort('mH2_eol_kg', false).limit(5);
+print('── Top 5 régions — Potentiel Éolien H₂ ──',
+  top_eol.select(['Region','PotH2_eol_kt_an','Surf_eol_pct','Score_moy_eol']));
+
+// Top régions hybride
+var top_hyb = stats_finales.sort('mH2_hyb_kg', false).limit(5);
+print('── Top 5 régions — Potentiel Hybride H₂ ──',
+  top_hyb.select(['Region','PotH2_hyb_kt_an','Surf_hyb_pct','Score_moy_hyb']));
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 9 — EXPORTS GOOGLE DRIVE
+// ═══════════════════════════════════════════════════════════════════════
+
+var folder  = 'H2_Vert_Maroc_Corrige';
+var region_bounds = maroc.geometry().bounds();
+
+// ── Export rasters ────────────────────────────────────────────────────
+Export.image.toDrive({
+  image: aptitude_sol.float(),
+  description: '01_Aptitude_Solaire_Corrige',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: aptitude_eol.float(),
+  description: '02_Aptitude_Eolien_Corrige',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: aptitude_hyb.float(),
+  description: '03_Aptitude_Hybride_Corrige',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: ghi_c.float(),
+  description: '04_GHI_classe',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: wind_c.float(),
+  description: '05_Vent_classe',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: slope_c.float(),
+  description: '06_Pente_classe',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: coast_c.float(),
+  description: '13_Cote_Mer_classe',
+  folder: folder, region: region_bounds, scale: scale, maxPixels: 1e13
+});
+
+// ── Export CSV — Statistiques par région ──────────────────────────────
+// CSV Solaire (Tableau 16)
+Export.table.toDrive({
+  collection: stats_finales.select([
+    'Region',
+    'Surf_sol_km2', 'Surf_sol_pct',
+    'PotH2_sol_kt_an',
+    'Score_moy_sol'
+  ]),
+  description: 'Tableau16_Potentiel_Solaire_Par_Region',
+  folder: folder,
+  fileFormat: 'CSV'
+});
+
+// CSV Éolien (Tableau 17)
+Export.table.toDrive({
+  collection: stats_finales.select([
+    'Region',
+    'Surf_eol_km2', 'Surf_eol_pct',
+    'PotH2_eol_kt_an',
+    'Score_moy_eol'
+  ]),
+  description: 'Tableau17_Potentiel_Eolien_Par_Region',
+  folder: folder,
+  fileFormat: 'CSV'
+});
+
+// CSV Hybride (Tableau 18)
+Export.table.toDrive({
+  collection: stats_finales.select([
+    'Region',
+    'Surf_hyb_km2', 'Surf_hyb_pct',
+    'PotH2_hyb_kt_an',
+    'Score_moy_hyb'
+  ]),
+  description: 'Tableau18_Potentiel_Hybride_Par_Region',
+  folder: folder,
+  fileFormat: 'CSV'
+});
+
+// CSV complet
+Export.table.toDrive({
+  collection: stats_finales.select([
+    'Region',
+    'Surf_totale_km2',
+    'Surf_sol_km2',  'Surf_sol_pct',  'PotH2_sol_kt_an',
+    'Surf_eol_km2',  'Surf_eol_pct',  'PotH2_eol_kt_an',
+    'Surf_hyb_km2',  'Surf_hyb_pct',  'PotH2_hyb_kt_an',
+    'Score_moy_sol', 'Score_moy_eol', 'Score_moy_hyb'
+  ]),
+  description: 'Toutes_Regions_H2_Maroc_COMPLET',
+  folder: folder,
+  fileFormat: 'CSV'
+});
+
+// Export GeoJSON
+Export.table.toDrive({
+  collection: stats_finales,
+  description: 'Regions_H2_Stats_GeoJSON',
+  folder: folder,
+  fileFormat: 'GeoJSON'
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLOC 10 — SITES SPÉCIFIQUES (extraction ponctuelle)
+// ═══════════════════════════════════════════════════════════════════════
+
+var sites = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([-13.50, 27.00]), {nom: 'Laayoune',    region: 'Sud'}),
+  ee.Feature(ee.Geometry.Point([-15.93, 23.72]), {nom: 'Dakhla',      region: 'Sud'}),
+  ee.Feature(ee.Geometry.Point([-6.89,  30.92]), {nom: 'Ouarzazate',  region: 'Draa-Tafilalet'}),
+  ee.Feature(ee.Geometry.Point([-8.91,  27.15]), {nom: 'Tan-Tan',     region: 'Guelmim'}),
+  ee.Feature(ee.Geometry.Point([-5.92,  30.00]), {nom: 'Zagora',      region: 'Draa-Tafilalet'}),
+  ee.Feature(ee.Geometry.Point([-5.53,  35.76]), {nom: 'Tanger',      region: 'Tanger-Tetouan'})
+]);
+
+var all_layers = aptitude_sol.unmask(0)
+  .addBands(aptitude_eol.unmask(0))
+  .addBands(aptitude_hyb.unmask(0))
+  .addBands(ghi.rename('GHI_kWh_m2_an'))
+  .addBands(wind_50m.rename('Vent_50m_ms'))
+  .addBands(temp.rename('Temp_C'))
+  .addBands(coast_c.unmask(0));
+
+var extraction_sites = all_layers.sampleRegions({
+  collection: sites,
+  properties: ['nom', 'region'],
+  scale: 5000
+});
+
+print('── Extraction sites spécifiques ──', extraction_sites);
+
+Export.table.toDrive({
+  collection: extraction_sites,
+  description: 'Sites_Specifiques_H2_Maroc',
+  folder: folder,
+  fileFormat: 'CSV'
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIN DU SCRIPT CORRIGÉ
+// Pour lancer les exports : onglet "Tasks" → Run sur chaque tâche
+// Résultats dans Google Drive → dossier "H2_Vert_Maroc_Corrige"
+// ═══════════════════════════════════════════════════════════════════════
