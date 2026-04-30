@@ -1,0 +1,60 @@
+<h1>🌍 Projet H₂ Vert Maroc — Analyse Géospatiale &amp; Potentiel 🔋</h1>
+<div align="center">
+  <img alt="Earth Engine" src="https://img.shields.io/badge/Google%20Earth%20Engine-JavaScript-green?style=for-the-badge&logo=google" />
+  <img alt="GIS" src="https://img.shields.io/badge/GIS-Spatial%20Analysis-blue?style=for-the-badge" />
+  <img alt="Status" src="https://img.shields.io/badge/Status-Final%20V6.0-brightgreen?style=for-the-badge" />
+</div>
+
+<p><br></p>
+<p>Bienvenue sur le dépôt du script complet (<strong>Version 6.0</strong>) dédié à l'évaluation et l'analyse du potentiel de production d'hydrogène vert (H₂) au Maroc (incluant les Provinces du Sud). </p>
+<p>Ce travail est destiné à des fins de recherche et vise à faire l'objet d'une publication scientifique ultérieure.</p>
+<hr />
+<h2>🎯 Objectif Principal</h2>
+<p>Le script identifie, classe et évalue les zones les plus propices à l'installation d'infrastructures de production d'hydrogène vert. L'analyse génère des cartes d'aptitude normalisées de <strong>0 à 100%</strong> pour trois catégories :
+- ☀️ <strong>Aptitude Solaire</strong>
+- 🌬️ <strong>Aptitude Éolien</strong>
+- ⚡ <strong>Aptitude Hybride</strong> (Moyenne Solaire + Éolien)</p>
+<hr />
+<h2>🔬 Données et Méthodologie</h2>
+<p>L'analyse est entièrement basée sur le cloud computing via <strong>Google Earth Engine (GEE)</strong>. Elle intègre et pondère <strong>9 critères géo-environnementaux et d'infrastructure</strong> en utilisant la méthode d'Analyse Hiérarchique des Procédés (AHP).</p>
+<h3>📖 Consulter la Méthodologie Détaillée</h3>
+<blockquote>
+<p>Pour des détails approfondis sur les formules, le traitement des données ERA5 (modélisation du rayonnement et extrapolation du vent) et la matrice de pondération AHP, veuillez consulter le document dédié :
+👉 <strong><a href="./METHODOLOGIE.md">Lien vers la Méthodologie (METHODOLOGIE.md)</a></strong></p>
+</blockquote>
+<h3>Les Critères Étudiés :</h3>
+<ol>
+<li><strong>Météorologie</strong> : Irradiation Solaire GHI, Vitesse du Vent (extrapolée à 200m), Température (LST).</li>
+<li><strong>Géographie</strong> : Pente du terrain, occupation des sols, distance à la mer.</li>
+<li><strong>Infrastructures</strong> : Proximité des réseaux électriques, routes, centres urbains, rivières et barrages.</li>
+</ol>
+<hr />
+<h2>📍 12 Sites Stratégiques</h2>
+<p>En plus de l'analyse globale, l'étude extrait des données statistiques précises pour <strong>12 sites majeurs</strong> :
+1. Dakhla | 2. Tarfaya | 3. Tan-Tan | 4. Agadir | 5. Safi | 6. Jorf Lasfar
+7. Kénitra | 8. Tanger | 9. Meknès | 10. Nador | 11. Béni Mellal | 12. Ouarzazate</p>
+<hr />
+<h2>🚀 Guide d'Utilisation sur Earth Engine</h2>
+<ol>
+<li>Connectez-vous à votre compte <a href="https://code.earthengine.google.com/">Google Earth Engine</a>.</li>
+<li>Copiez l'intégralité du fichier <code>script.js</code> et collez-le dans l'éditeur de code (Code Editor).</li>
+<li>Adaptez le chemin de la variable <code>regions</code> avec votre propre <em>FeatureCollection</em> (pour les statistiques régionales).</li>
+<li>Cliquez sur <strong>Run</strong>.</li>
+<li>Allez dans l'onglet <strong>Tasks</strong> (à droite). Vous y verrez 16 tâches prêtes à être exportées vers votre Google Drive.</li>
+</ol>
+<hr />
+<h2>📂 Exports Générés</h2>
+<p>L'exécution des tâches produira le dossier <code>H2_Vert_Maroc_Final_v6</code> contenant :</p>
+<p>| Type | Fichier | Description |
+|:---:|:---|:---|
+| 📊 <strong>CSV</strong> | <code>15_Extraction_12_Sites_H2.csv</code> | Valeurs exactes (scores et aptitudes) pour les 12 sites focaux. |
+| 📊 <strong>CSV</strong> | <code>16_Stats_Regions_H2.csv</code> | Statistiques moyennes des potentiels pour chaque région. |
+| 🗺️ <strong>TIF</strong> | <code>01_Aptitude_Solaire...</code> | Carte finale (0-100%) du potentiel Solaire. |
+| 🗺️ <strong>TIF</strong> | <code>02_Aptitude_Eolien...</code> | Carte finale (0-100%) du potentiel Éolien. |
+| 🗺️ <strong>TIF</strong> | <code>03_Aptitude_Hybride...</code> | Carte finale (0-100%) du potentiel Hybride. |
+| 🧩 <strong>TIF</strong> | <code>04_</code> à <code>14_</code> | Cartes des sous-critères (GHI, Vent, Pente, Villes, Masques, etc.). |</p>
+<hr />
+<h2>📝 Auteurs et Citation</h2>
+<p>Ce script a été structuré en vue de la préparation d'une publication académique.
+<em>(Les informations de citation et les noms des auteurs seront mis à jour au moment de la publication officielle).</em></p>
+<p>⚠️ <strong>Licence :</strong> Veuillez contacter l'auteur avant toute réutilisation académique ou commerciale de ce code.</p>
