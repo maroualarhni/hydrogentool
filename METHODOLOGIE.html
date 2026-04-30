@@ -1,0 +1,70 @@
+<h1>📖 Méthodologie Détaillée du Projet H₂ Vert Maroc</h1>
+<p>Ce document annexe détaille la méthodologie scientifique et technique employée dans le cadre de l'évaluation du potentiel de l'hydrogène vert au Maroc (Solaire, Éolien et Hybride).</p>
+<hr />
+<h2>1. Origine et Traitement des Données Climatologiques (Météo)</h2>
+<p>Les données météorologiques utilisées dans ce projet proviennent de la réanalyse climatique <strong>ERA5-Land</strong>, développée par le Centre Européen pour les Prévisions Météorologiques à Moyen Terme (ECMWF). ERA5-Land fournit des données climatiques cohérentes sur plusieurs décennies avec une résolution spatiale de 9 km, en combinant des observations mondiales avec un modèle de prévision numérique (IFS).</p>
+<h3>A. Potentiel Solaire : Irradiation Solaire (GHI)</h3>
+<ul>
+<li><strong>Source</strong> : <code>ECMWF/ERA5_LAND</code> (Moyenne annuelle sur la période 2018-2022).</li>
+<li><strong>Paramètre</strong> : <em>Surface solar radiation downwards</em> (Somme de l'irradiation solaire descendante).</li>
+<li><strong>Méthodologie ERA5</strong> : L'estimation de ce paramètre repose sur la modélisation du transfert radiatif atmosphérique en ondes courtes. Le modèle simule avec précision la manière dont le rayonnement solaire interagit avec l'atmosphère avant de toucher le sol. Il intègre de manière dynamique l'atténuation, la diffusion et l'absorption causées par :</li>
+<li>La couverture nuageuse.</li>
+<li>Les aérosols.</li>
+<li>La vapeur d'eau.</li>
+<li>L'ozone stratosphérique.</li>
+</ul>
+<h3>B. Potentiel Éolien : Vitesse du Vent et Extrapolation (Vecteurs U et V)</h3>
+<ul>
+<li><strong>Source</strong> : <code>ECMWF/ERA5_LAND</code> (Moyenne sur la période 2018-2022).</li>
+<li><strong>Paramètres Initiaux</strong> : Composantes vectorielles <code>U</code> et <code>V</code> du vent à 10 mètres du sol.</li>
+<li><strong>Méthodologie ERA5 et Traitement</strong> : </li>
+<li><strong>Vecteurs du Vent</strong> : Dans le modèle ERA5, le vent n'est pas fourni directement comme une simple vitesse, mais décomposé en deux vecteurs directionnels :<ul>
+<li>La composante <strong>U (zonale)</strong> : représente le vent soufflant d'Ouest en Est.</li>
+<li>La composante <strong>V (méridienne)</strong> : représente le vent soufflant du Nord au Sud.</li>
+</ul>
+</li>
+<li><strong>Calcul de la Vitesse Scalaire</strong> : Pour obtenir la vitesse absolue du vent (indépendamment de sa direction), le script combine ces deux vecteurs en utilisant le théorème de Pythagore : 
+     $$Vitesse = \sqrt{U^2 + V^2}$$</li>
+<li><strong>Extrapolation à 200m</strong> : Les éoliennes modernes de grande capacité ont des hauteurs de moyeu qui dépassent largement les 10 mètres. Pour évaluer le potentiel réel, cette vitesse à 10m est extrapolée à <strong>200 mètres</strong> en utilisant la <strong>loi logarithmique du profil des vents</strong>. </li>
+<li><strong>Formule utilisée</strong> : $V_{200} = V_{10} \times \frac{\ln(200 / Z_0)}{\ln(10 / Z_0)}$</li>
+<li><strong>Rugosité ($Z_0$)</strong> : Une longueur de rugosité de <code>0.03 m</code> a été choisie, ce qui est caractéristique des terrains ouverts et plats, très présents dans les régions étudiées.</li>
+</ul>
+<h3>C. Correction Thermique (LST)</h3>
+<ul>
+<li><strong>Source</strong> : <code>MODIS MOD11A2</code> (2010-2023).</li>
+<li><strong>Objectif</strong> : La température de surface diurne (LST) est utilisée pour pénaliser les zones où les températures extrêmes pourraient réduire l'efficacité des panneaux photovoltaïques et des électrolyseurs.</li>
+</ul>
+<hr />
+<h2>2. L'Analyse Hiérarchique des Procédés (AHP)</h2>
+<p>Afin de combiner des critères de natures très différentes (météo, géographie, infrastructures), le modèle utilise la méthode d'Analyse Hiérarchique des Procédés (AHP) pour attribuer un poids spécifique à chaque critère en fonction de son importance.</p>
+<h3>A. Reclassification</h3>
+<p>Toutes les données brutes ont été normalisées et reclassées sur une échelle de <strong>1 à 5</strong> (1 étant le moins favorable, et 5 le plus favorable). </p>
+<h3>B. Pondérations Appliquées</h3>
+<p>Les poids ont été calculés via une matrice de comparaison par paires. Voici la répartition finale :</p>
+<p><strong>Poids pour l'Aptitude Solaire (Max = 4.596) :</strong>
+1. <strong>GHI Solaire</strong> : 35.4 %
+2. <strong>Pente du Terrain</strong> : 23.8 %
+3. <strong>Température (LST)</strong> : 16.1 %
+4. <strong>Proximité des Routes</strong> : 10.9 %
+5. <strong>Proximité des Villes</strong> : 7.5 %
+6. <strong>Proximité Réseau Électrique</strong> : 2.6 %
+7. <strong>Proximité Rivières</strong> : 1.3 %
+8. <strong>Proximité Barrages</strong> : 1.3 %
+9. <strong>Proximité Côte/Mer</strong> : 1.2 %</p>
+<p><strong>Poids pour l'Aptitude Éolien (Max = 4.606) :</strong>
+1. <strong>Vitesse du Vent (200m)</strong> : 40.2 %
+2. <strong>Pente du Terrain</strong> : 20.8 %
+3. <strong>Proximité des Villes</strong> : 14.0 %
+4. <strong>Proximité Réseau Électrique</strong> : 9.1 %
+5. <strong>Proximité des Routes</strong> : 9.1 %
+6. <strong>Température (LST)</strong> : 2.4 %
+7. <strong>Proximité Rivières</strong> : 1.5 %
+8. <strong>Proximité Barrages</strong> : 1.5 %
+9. <strong>Proximité Côte/Mer</strong> : 1.4 %</p>
+<h3>C. Masque d'Exclusion Stricte</h3>
+<p>Avant de générer les cartes finales, un masque d'exclusion binaire est appliqué. Il élimine toute zone qui n'est physiquement ou légalement pas exploitable :
+- Les pentes supérieures à 45°.
+- Les plans d'eau permanents et temporaires.
+- Les zones urbaines denses.
+- Les zones couvertes de neige ou de glace.</p>
+<p>Le score final de chaque pixel est ensuite ramené sur une échelle de <strong>0 à 100</strong> pour faciliter la lecture et la comparaison des cartes d'aptitude.</p>
